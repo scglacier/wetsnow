@@ -1,0 +1,134 @@
+// This code is the result of monthly wet snow area calculation for glaciers in the area covered by SAR image
+// 1. Basic Settings
+var dem = ee.Image("USGS/SRTMGL1_003");
+// 2. OTSU Threshold Functions (Unchanged)
+function otsu1(histogram) {
+    var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+    var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+    var size = means.length().get([0]);
+    var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean = sum.divide(total);
+    var indices = ee.List.sequence(1, size);
+    var bss = indices.map(function (i) {
+        var aCounts = counts.slice(0, 0, i);
+        var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+        var aMeans = means.slice(0, 0, i);
+        var aMean = aMeans.multiply(aCounts)
+            .reduce(ee.Reducer.sum(), [0]).get([0])
+            .divide(aCount);
+        var bCount = total.subtract(aCount);
+        var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+        return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+            bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+    return means
+        .sort(bss)
+        .get([-1]);
+}
+
+function otsu(image) {
+    var histogram = image.reduceRegion({
+        reducer: ee.Reducer.histogram(1000, 0.01),
+        geometry: table,
+        scale: 30,
+        bestEffort: true,
+    });
+    return otsu1(histogram.get(histogram.keys().get(0)));
+}
+
+function applyOtsuThreshold(image) {
+    var threshold = otsu(image);
+    var binaryImage1 = image.gt(threshold);
+    var clippedSRTM = dem.clip(table);
+    var medianElevation = clippedSRTM.reduceRegion({
+        reducer: ee.Reducer.median(),
+        geometry: table,
+        scale: 30
+    });
+
+    var ege = image.lt(threshold);
+    var dmeE = clippedSRTM.gt(medianElevation.getNumber('elevation'));
+    var elevationAboveMedian = ege.and(dmeE);
+
+    var area = elevationAboveMedian.multiply(ee.Image.pixelArea()).divide(1000000)
+        .reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: elevationAboveMedian.geometry(),
+            scale: 30,
+            bestEffort: true,
+        }).get('R');
+    var resultImage = elevationAboveMedian.set('threshold', threshold).set('area', area);
+
+    return resultImage
+}
+
+// 3. Main Logic
+var table = geometry;
+var resu1 = ee.List([]);
+var year = year; 
+var refstartDay = year - 1 + "-12-01";
+var refendDay = year + "-02-01";
+var mask_LS = laysha.select('b3').lt(1);
+var mask_ANG = laysha.select('b2').lt(75).or(laysha.select('b2').gt(15));
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+    .filterBounds(table)
+    .filterDate('2016-12-01', '2023-10-01')
+    .filterMetadata('instrumentMode', 'equals', 'IW')
+    .filterMetadata('orbitProperties_pass', 'equals', 'ASCENDING')
+    .filterMetadata('transmitterReceiverPolarisation', 'equals', ['VV', 'VH'])
+    .select(['VV', 'VH'])
+    .map(function process(image) { return image.clip(table) })
+    .map(function (image) {
+        var maskedImage1 = image.updateMask(mask_LS);
+        var maskedImage2 = maskedImage1.updateMask(mask_ANG);
+        return maskedImage2;
+    });
+
+var refimage = S1.filterDate(refstartDay, refendDay).reduce(ee.Reducer.median());
+function sb(image) {
+    return image.subtract(refimage).select(['VV', 'VH'], ['sb_VV', 'sb_VH']);
+}
+// 4. Monthly Processing
+var years = ee.List.sequence(year, year);
+var months = ee.List.sequence(month, month); 
+function EndR(image) {
+    var a = image.select('sb_VV');
+    var b = image.select('sb_VH');
+    var R = a.multiply(b).add(10).log10();
+    return image.addBands(R.rename('R'));
+}
+var melt_monthlyMIN = ee.ImageCollection.fromImages(
+    years.map(function (year) {
+        return months.map(function (month) {
+            var zz = S1.filter(ee.Filter.calendarRange(year, year, 'year')).filter(ee.Filter.calendarRange(month, month, 'month'));
+            var tim = zz.first().get('system:index');
+            var resu = zz.min().set('system:index', tim);
+            return resu;
+        });
+    }).flatten())
+var sb_collection = melt_monthlyMIN.map(sb);
+var R_Collection = sb_collection.map(EndR);
+var otsu_collection = R_Collection.select('R').map(applyOtsuThreshold);
+resu1 = resu1.cat(otsu_collection);
+// 5. Result Formatting
+function tofeatue(image, first) {
+    var date1 = image.get('system:index')
+    var date = ee.String(date1).slice(17, 23); 
+    var properties = image.toDictionary();
+    var value = properties.get('area');
+    var threshold = image.get('threshold');
+        var countvalueDic = ee.Dictionary([date, value]);
+    return ee.Dictionary(first).combine(countvalueDic);
+}
+
+var resu2 = ee.ImageCollection.fromImages(resu1);
+var Show1 = resu2.iterate(tofeatue, ee.Dictionary());
+
+// 6. Export
+var resultFeature = ee.Feature(null,Show1);
+Export.table.toDrive({
+    collection: ee.FeatureCollection([resultFeature]),
+    description: 'WetSnow_Area_2023_OneROI',
+    fileFormat: 'CSV'
+});
